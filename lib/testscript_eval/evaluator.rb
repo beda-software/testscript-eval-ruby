@@ -19,56 +19,86 @@ module TestscriptEval
     }.freeze
 
     attr_reader :warnings
+    # Swappable between phases, e.g. to record each test's requests on its own
+    attr_writer :client, :validator
 
     # `root_dir` resolves file:// fixture references, `include_dir` the `!include` tags of
-    # YAML fixtures
+    # YAML fixtures. `client` defaults to a Client for env baseUrl/authorization, `validator`
+    # (validateProfileId asserts) to a ServerValidator, which runs $validate on that server
     def initialize(definition, env, root_dir: Dir.pwd, include_dir: File.join(root_dir, "tests", "resources"),
-                   client: nil)
+                   client: nil, validator: nil)
       @definition = definition
       @env = env.transform_keys(&:to_s)
       @root_dir = root_dir
       @include_dir = include_dir
       @client = client
+      @validator = validator
       @warnings = []
+      @created = []
     end
 
-    def run
-      logger.info("Test #{@definition["name"]}")
-      @client ||= Client.new(@env["baseUrl"], authorization: @env["authorization"])
+    def tests
+      @definition.fetch("test", [])
+    end
 
+    # Runs the whole script and returns the messages of failed warningOnly asserts
+    def run
+      start
+      tests.each { |test| run_test(test) }
+      @warnings
+    ensure
+      finish
+    end
+
+    # Loads and autocreates fixtures, resolves variables and runs setup. When it raises,
+    # `finish` still cleans up whatever was created
+    def start
+      logger.info("Test #{@definition["name"]}")
       logger.info("Loading fixtures")
       @fixtures = setup_fixtures
-      @created = []
+      autocreate_fixtures
+      logger.info("Loading variables")
+      @variables = setup_variables
 
+      logger.info("Setup")
+      eval_actions(@definition.dig("setup", "action") || [])
+    end
+
+    # Runs one of the script's tests and returns the messages of its failed warningOnly asserts
+    def run_test(test)
+      logger.info("Test #{test["name"]}, #{test["description"]}")
+      count = @warnings.length
+      eval_actions(test.fetch("action", []))
+      @warnings[count..]
+    end
+
+    # Runs teardown (when `start` got as far as variables), then autodeletes fixtures
+    def finish
+      return if @finished
+
+      @finished = true
       begin
-        autocreate_fixtures
-        logger.info("Loading variables")
-        @variables = setup_variables
-
-        begin
-          logger.info("Setup")
-          eval_actions(@definition.dig("setup", "action") || [])
-
-          logger.info("Testing")
-          @definition.fetch("test", []).each do |test|
-            logger.info("Test #{test["name"]}, #{test["description"]}")
-            eval_actions(test.fetch("action", []))
-          end
-        ensure
+        if @variables
           logger.info("Teardown")
           eval_actions(@definition.dig("teardown", "action") || [])
         end
       ensure
-        autodelete_fixtures
+        autodelete_fixtures if @fixtures
       end
-
-      @warnings
     end
 
     private
 
     def logger
       TestscriptEval.logger
+    end
+
+    def client
+      @client ||= Client.build(@env["baseUrl"], authorization: @env["authorization"])
+    end
+
+    def validator
+      @validator || ServerValidator.new(client)
     end
 
     def fixture_definitions
@@ -93,7 +123,7 @@ module TestscriptEval
         YamlLoader.load(File.read(path), include_dir: @include_dir)
       # relative references to FHIR server baseUrl
       elsif reference.match?(/\A[A-Z]/)
-        _response, resource = @client.execute(reference, method: "get")
+        _response, resource = client.execute(reference, method: "get")
         resource
       else
         raise Error, "Reference '#{reference}' is not supported"
@@ -112,7 +142,7 @@ module TestscriptEval
         # A fixture with an id is created under that id (update as create), so references
         # between fixtures (e.g. Patient/<id>) resolve on the server as written
         path, method = fixture.key?("id") ? ["#{fixture["resourceType"]}/#{fixture["id"]}", "put"] : [fixture["resourceType"], "post"]
-        response, resource = @client.execute(path, method: method, data: fixture)
+        response, resource = client.execute(path, method: method, data: fixture)
         unless (200..299).cover?(response.status)
           raise Error, "Autocreate of fixture '#{fixture_id}' failed with status #{response.status}: #{resource}"
         end
@@ -150,7 +180,7 @@ module TestscriptEval
         end
 
         logger.info("Autodelete fixture #{fixture_id}")
-        response, _resource = @client.execute("#{fixture["resourceType"]}/#{fixture["id"]}", method: "delete")
+        response, _resource = client.execute("#{fixture["resourceType"]}/#{fixture["id"]}", method: "delete")
         unless (200..299).cover?(response.status) || [404, 410].include?(response.status)
           logger.warn("Autodelete of fixture #{fixture_id} failed with status #{response.status}")
         end
@@ -209,7 +239,7 @@ module TestscriptEval
 
       data = operation.key?("sourceId") ? @fixtures.fetch(operation["sourceId"]) : nil
       path, query = target.split("?", 2)
-      response, resource = @client.execute(path, method: method, data: data, params: query_params(query))
+      response, resource = client.execute(path, method: method, data: data, params: query_params(query))
 
       @fixtures[operation["responseId"]] = resource if operation.key?("responseId")
       [response, resource]
@@ -226,7 +256,7 @@ module TestscriptEval
 
     def assertion_context
       Assertions::Context.new(
-        variables: @variables, fixtures: @fixtures, client: @client, profiles: @definition.fetch("profile", [])
+        variables: @variables, fixtures: @fixtures, validator: validator, profiles: @definition.fetch("profile", [])
       )
     end
   end

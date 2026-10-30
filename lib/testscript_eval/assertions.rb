@@ -5,7 +5,7 @@ require "jsonpath"
 module TestscriptEval
   module Assertions
     # What an assert can see besides the last operation's response
-    Context = Struct.new(:variables, :fixtures, :client, :profiles, keyword_init: true)
+    Context = Struct.new(:variables, :fixtures, :validator, :profiles, keyword_init: true)
 
     RESPONSE_CODES = { "okay" => 200, "created" => 201, "bad" => 400, "notFound" => 404 }.freeze
 
@@ -104,33 +104,8 @@ module TestscriptEval
     def validate_profile_id(_assert_name, assertion, _response, resource, context)
       profile_url = resolve_profile(assertion["validateProfileId"], context.profiles)
       check(resource.is_a?(Hash) && resource.key?("resourceType"), "No resource to validate against #{profile_url}")
-      # Pass the profile both ways: as the $validate `profile` parameter, and in meta.profile,
-      # which servers that ignore the parameter (e.g. Aidbox) validate against
-      meta = resource.fetch("meta", {})
-      payload = resource.merge("meta" => meta.merge("profile" => [*meta.fetch("profile", []), profile_url].uniq))
-      response, outcome = context.client.execute(
-        "#{resource["resourceType"]}/$validate", method: "post", data: payload, params: { "profile" => profile_url }
-      )
-      # No validation happened (auth, $validate unsupported, server error): an engine/infrastructure
-      # error, never a check failure, so warningOnly does not hide it
-      if [401, 403, 404, 405].include?(response.status) || response.status >= 500
-        raise Error, "$validate against #{profile_url} could not run: status #{response.status}: #{outcome}"
-      end
-
-      # Non-2xx: the body comes back wrapped in an ErrorBody
-      outcome = parse_json(outcome.to_s) unless outcome.is_a?(Hash)
-      unless outcome.is_a?(Hash) && outcome["resourceType"] == "OperationOutcome"
-        raise Error, "$validate against #{profile_url} returned no OperationOutcome " \
-                     "(status #{response.status}): #{outcome}"
-      end
-
-      errors = outcome.fetch("issue", []).select { |issue| %w[error fatal].include?(issue["severity"]) }.map do |issue|
-        "[#{issue["severity"]}] #{issue.fetch("expression", []).join(", ")}: " \
-          "#{issue["diagnostics"] || issue.dig("details", "text")}"
-      end
-      # A 2xx, or a 4xx such as 400/422 with an OperationOutcome, is the validation result
-      check(response.status < 400 && errors.empty?,
-            "Validation against #{profile_url} failed (status #{response.status}):\n#{errors.join("\n")}")
+      errors = context.validator.call(resource, profile_url)
+      check(errors.empty?, "Validation against #{profile_url} failed:\n#{errors.join("\n")}")
     end
 
     # validateProfileId is the id of a TestScript.profile entry; a canonical URL given
@@ -141,12 +116,6 @@ module TestscriptEval
       return profile_id if profile_id.include?("/")
 
       raise Error, "validateProfileId '#{profile_id}' does not match any TestScript.profile id"
-    end
-
-    def parse_json(string)
-      JSON.parse(string)
-    rescue JSON::ParserError
-      nil
     end
 
     RULES = {
@@ -179,9 +148,9 @@ module TestscriptEval
       end
       nil
     rescue AssertionFailed => e
-      raise unless assertion.fetch("warningOnly", false)
-
       message = "#{assertion["description"]}: #{e.message}"
+      raise AssertionFailed, message unless assertion.fetch("warningOnly", false)
+
       TestscriptEval.logger.warn("warningOnly assert failed: #{message}")
       message
     end

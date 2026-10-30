@@ -50,6 +50,7 @@ end
 require_relative "testscript_eval/yaml_loader"
 require_relative "testscript_eval/misc"
 require_relative "testscript_eval/client"
+require_relative "testscript_eval/server_validator"
 require_relative "testscript_eval/operations"
 require_relative "testscript_eval/assertions"
 require_relative "testscript_eval/evaluator"

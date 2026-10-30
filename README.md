@@ -41,7 +41,32 @@ Options:
   `file://tests/resources/patient.yaml`.
 - `include_dir:` (default: `<root_dir>/tests/resources`) resolves `!include path` tags in YAML fixtures.
 
+- `client:` a `TestscriptEval::Client` to send requests with (default: `Client.build(baseUrl, authorization:)`).
+  `Client.new(fhir_client) { |reply| ... }` wraps any configured `FHIR::Client` and yields every
+  `FHIR::ClientReply`, e.g. to record requests.
+- `validator:` what `validateProfileId` asserts call: anything responding to `call(resource, profile_url)` that
+  returns the validation error messages (default: `ServerValidator`, `$validate` on the server under test).
+
 YAML files are loaded safely, with dates and datetimes kept as strings.
+
+### Running a script step by step
+
+`TestscriptEval.eval` is `Evaluator#run`, which is made of three phases that can also be called one at a time,
+e.g. to report every test separately:
+
+```ruby
+evaluator = TestscriptEval::Evaluator.new(definition, env)
+begin
+  evaluator.start                       # fixtures, autocreate, variables, setup
+  evaluator.tests.each do |test|
+    warnings = evaluator.run_test(test) # raises on a failed assert
+  end
+ensure
+  evaluator.finish                      # teardown, autodelete; also after a failed start
+end
+```
+
+`client=` and `validator=` swap the client and validator between phases.
 
 ### Logging
 

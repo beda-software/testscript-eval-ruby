@@ -40,37 +40,46 @@ module TestscriptEval
 
   class OperationOutcome < ErrorBody; end
 
-  # A FHIR client that hands back the raw response along with the parsed resource, as asserts
-  # check status codes and headers, and resources are kept as plain Hashes for FHIRPath
-  class Client < FHIR::Client
+  # Sends requests through a FHIR::Client and hands back the raw response along with the parsed
+  # resource, as asserts check status codes and headers, and resources are kept as plain Hashes
+  # for FHIRPath. Every FHIR::ClientReply is also passed to `on_reply` (e.g. to record requests)
+  class Client
     JSON_FORMAT = FHIR::Formats::ResourceFormat::RESOURCE_JSON
 
-    def initialize(base_url, authorization: nil)
+    # A client of its own, sending `authorization` as is in the Authorization header
+    def self.build(base_url, authorization: nil)
       raise Error, "FHIR server base URL is not set" if base_url.nil? || base_url.empty?
 
-      super(base_url)
-      return unless authorization
+      fhir_client = FHIR::Client.new(base_url)
+      fhir_client.additional_headers = { "Authorization" => authorization } if authorization
+      new(fhir_client)
+    end
 
-      @security_headers = { "Authorization" => authorization }
-      @use_basic_auth = true
+    def initialize(fhir_client, &on_reply)
+      @fhir_client = fhir_client
+      @on_reply = on_reply
     end
 
     def execute(path, method: "get", data: nil, params: {})
       path = "#{path}?#{URI.encode_www_form(params)}" unless params.empty?
-      headers = { "Accept" => JSON_FORMAT }
-      reply =
-        case method.to_s.downcase
-        when "get" then get(path, headers)
-        when "delete" then delete(path, headers)
-        when "post" then post(path, data, headers.merge("Content-Type" => JSON_FORMAT))
-        when "put" then put(path, data, headers.merge("Content-Type" => JSON_FORMAT))
-        else raise Error, "HTTP method '#{method}' is not supported"
-        end
+      # fhir_headers carries the client's additional headers, which its raw HTTP methods skip
+      headers = @fhir_client.fhir_headers.merge("Accept" => JSON_FORMAT)
+      reply = request(method.to_s.downcase, path, data, headers)
+      @on_reply&.call(reply)
       response = Response.new(reply.code.to_i, Headers.new(reply.response[:headers]), reply.response[:body])
       [response, parse_resource(response)]
     end
 
     private
+
+    # FHIR::Client keeps its raw HTTP methods private
+    def request(method, path, data, headers)
+      case method
+      when "get", "delete" then @fhir_client.send(method, path, headers)
+      when "post", "put" then @fhir_client.send(method, path, data, headers.merge("Content-Type" => JSON_FORMAT))
+      else raise Error, "HTTP method '#{method}' is not supported"
+      end
+    end
 
     def parse_resource(response)
       body = response.body

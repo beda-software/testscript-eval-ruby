@@ -149,6 +149,80 @@ RSpec.describe TestscriptEval::Evaluator do
     end
   end
 
+  describe "phases" do
+    let(:definition) do
+      script(
+        fixture: [{ "id" => "p", "autocreate" => true, "autodelete" => true,
+                    "resource" => { "reference" => "file://resources/patient.yaml" } }],
+        variable: [{ "name" => "family", "sourceId" => "p", "expression" => "Patient.name.family" }],
+        test: [
+          { "name" => "pass", "action" => read_patient({ "response" => "okay" }) },
+          { "name" => "warn", "action" => read_patient({ "expression" => "Patient.name.given.first()",
+                                                          "value" => "${family}", "warningOnly" => true }) },
+          { "name" => "fail", "action" => read_patient({ "expression" => "Patient.name.family = 'Smith'",
+                                                          "warningOnly" => false }) }
+        ]
+      )
+    end
+    let(:evaluator) { described_class.new(definition, env, root_dir: FIXTURES_DIR) }
+
+    before do
+      stub_request(:put, "#{base}/Patient/test-patient").to_return(status: 201, body: "")
+      stub_request(:delete, "#{base}/Patient/test-patient").to_return(status: 204)
+      stub_request(:get, "#{base}/Patient/example").to_return(status: 200, body: patient.to_json, headers: json)
+    end
+
+    it "runs tests one at a time and returns each test's warnings" do
+      evaluator.start
+      pass, warn, fail = evaluator.tests
+      expect(evaluator.run_test(pass)).to eq([])
+      expect(evaluator.run_test(warn)).to contain_exactly(/Got "Peter"/)
+      expect { evaluator.run_test(fail) }.to raise_error(TestscriptEval::AssertionFailed)
+      expect(a_request(:delete, "#{base}/Patient/test-patient")).not_to have_been_made
+
+      evaluator.finish
+      evaluator.finish
+      expect(a_request(:delete, "#{base}/Patient/test-patient")).to have_been_made.once
+    end
+
+    it "cleans up after a failed start" do
+      stub_request(:put, "#{base}/Patient/test-patient").to_return(status: 201, body: { "resourceType" => "Patient",
+                                                                                         "id" => "test-patient" }.to_json,
+                                                                    headers: json)
+      definition["variable"] = [{ "name" => "missing", "sourceId" => "p", "expression" => "Patient.gender" }]
+      expect { evaluator.start }.to raise_error(TestscriptEval::Error, /missing expression returned no value/)
+      evaluator.finish
+      expect(a_request(:delete, "#{base}/Patient/test-patient")).to have_been_made
+    end
+
+    it "sends requests through a given FHIR client, passing every reply on" do
+      fhir_client = FHIR::Client.new(base)
+      fhir_client.additional_headers = { "Authorization" => "Bearer token" }
+      replies = []
+      evaluator.client = TestscriptEval::Client.new(fhir_client) { |reply| replies << reply }
+
+      evaluator.start
+      evaluator.run_test(evaluator.tests.first)
+      evaluator.finish
+
+      expect(replies.map { |reply| [reply.request[:method], reply.code] })
+        .to eq([[:put, 201], [:get, 200], [:delete, 204]])
+      expect(a_request(:get, "#{base}/Patient/example").with(headers: { "Authorization" => "Bearer token" }))
+        .to have_been_made
+    end
+
+    it "validates with a given validator" do
+      evaluator.validator = lambda do |resource, profile_url|
+        ["#{resource["resourceType"]} does not conform to #{profile_url}"]
+      end
+      evaluator.start
+      test = { "action" => read_patient({ "validateProfileId" => "http://example.org/profile" }) }
+      expect { evaluator.run_test(test) }
+        .to raise_error(TestscriptEval::AssertionFailed, %r{Patient does not conform to http://example.org/profile})
+      expect(a_request(:post, %r{\$validate})).not_to have_been_made
+    end
+  end
+
   describe "asserts" do
     before do
       stub_request(:get, "#{base}/Patient/example").to_return(status: 200, body: patient.to_json, headers: json)
