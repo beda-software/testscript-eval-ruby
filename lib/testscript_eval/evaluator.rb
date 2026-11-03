@@ -38,11 +38,10 @@ module TestscriptEval
     # Swappable between phases, e.g. to record each test's requests on its own
     attr_writer :client, :validator
 
-    # `root_dir` resolves file:// fixture references, `include_dir` the `!include` tags of
-    # YAML fixtures. `client` defaults to a Client for env baseUrl/authorization, `validator`
+    # `root_dir` resolves file:// fixture references. `!include` tags in YAML fixtures resolve
+    # against the fixture's own directory, or `include_dir` when given. `client` defaults to a Client for env baseUrl/authorization, `validator`
     # (validateProfileId asserts) to a ServerValidator, which runs $validate on that server
-    def initialize(definition, env, root_dir: Dir.pwd, include_dir: File.join(root_dir, "tests", "resources"),
-                   client: nil, validator: nil)
+    def initialize(definition, env, root_dir: Dir.pwd, include_dir: nil, client: nil, validator: nil)
       @definition = definition
       @env = env.transform_keys(&:to_s)
       @root_dir = root_dir
@@ -99,6 +98,7 @@ module TestscriptEval
       begin
         if @variables
           logger.info("Teardown")
+          @teardown = true
           eval_actions(@definition.dig("teardown", "action") || [])
         end
       ensure
@@ -166,7 +166,7 @@ module TestscriptEval
         raise Error, "Fixture '#{fixture_id}': file #{reference} is not found (#{path})" unless File.exist?(path)
 
         # JSON files are parsed as JSON: valid JSON is not always valid YAML, e.g. with tab indentation
-        TestscriptEval.load_file(path, include_dir: @include_dir)
+        TestscriptEval.load_file(path, **{ include_dir: @include_dir }.compact)
       # resources on the server: relative references to baseUrl (`Patient/example`) or absolute URLs
       elsif reference.match?(%r{\A([A-Z]|https?://)})
         read_server_fixture(fixture_id, reference)
@@ -371,6 +371,7 @@ module TestscriptEval
         path, method: method, data: data, params: query_params(query), headers: request_headers(operation),
               accept: operation["accept"], content_type: content_type
       )
+      response, resource = delete_each(path, query, response, resource) if teardown_multiple_delete?(method, query, response)
       @last = response
       @last_resource = resource
       if operation.key?("responseId")
@@ -409,6 +410,22 @@ module TestscriptEval
 
     def binary?(data)
       data.is_a?(Hash) && data["resourceType"] == "Binary" && data.key?("data")
+    end
+
+    # A teardown conditional delete the server refuses for matching several resources (412, e.g.
+    # Aidbox): teardown is cleanup, so delete every match instead
+    def teardown_multiple_delete?(method, query, response)
+      @teardown && method.to_s.casecmp?("delete") && !query.to_s.empty? && response.status == 412
+    end
+
+    def delete_each(path, query, response, resource)
+      logger.info("Conditional delete #{path}?#{query} matched several resources: deleting each")
+      _search, bundle = client.execute(path, method: "get", params: query_params(query))
+      targets = bundle.is_a?(Hash) ? bundle.fetch("entry", []).filter_map { |entry| entry["resource"] } : []
+      results = targets.map do |target|
+        client.execute("#{target["resourceType"]}/#{target["id"]}", method: "delete")
+      end
+      results.empty? ? [response, resource] : results.last
     end
 
     def request_headers(operation)

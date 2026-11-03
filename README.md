@@ -40,9 +40,9 @@ values for TestScript variables without a `sourceId`. Without one, it is read fr
 Options:
 
 - `root_dir:` (default: the current directory) resolves file fixture references (`.json`, `.xml`, `.yaml`),
-  as a `file://` URL or a path from the root: `file://tests/resources/patient.yaml`,
-  `/tests/resources/patient.yaml`, `../Fixtures/patient.xml`.
-- `include_dir:` (default: `<root_dir>/tests/resources`) resolves `!include path` tags in YAML fixtures.
+  as a `file://` URL or a path from the root: `file://resources/patient.yaml`,
+  `/resources/patient.yaml`, `../Fixtures/patient.xml`.
+- `include_dir:` resolves `!include path` tags in YAML fixtures (default: the fixture's own directory).
 
 - `client:` a `TestscriptEval::Client` to send requests with (default: `Client.build(baseUrl, authorization:)`).
   `Client.new(fhir_client) { |reply| ... }` wraps any configured `FHIR::Client` and yields every

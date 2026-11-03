@@ -253,6 +253,19 @@ RSpec.describe "TestScript features" do
       expect { run(definition) }.to raise_error(TestscriptEval::FixtureRejected, /failed with status 422/)
     end
 
+    it "deletes every match of a teardown conditional delete the server refuses for multiple matches" do
+      stub_request(:delete, "#{base}/Medication?code=x").to_return(status: 412, body: "")
+      search = { "resourceType" => "Bundle", "entry" => %w[m1 m2].map { |id| { "resource" => { "resourceType" => "Medication", "id" => id } } } }
+      stub_request(:get, "#{base}/Medication?code=x").to_return(status: 200, body: search.to_json, headers: json)
+      %w[m1 m2].each { |id| stub_request(:delete, "#{base}/Medication/#{id}").to_return(status: 204) }
+
+      definition = script(teardown: { "action" => [operation(type: { "code" => "delete" }, resource: "Medication", params: "?code=x")] })
+
+      expect(run(definition)).to eq([])
+      expect(a_request(:delete, "#{base}/Medication/m1")).to have_been_made
+      expect(a_request(:delete, "#{base}/Medication/m2")).to have_been_made
+    end
+
     it "explains a server fixture that does not exist" do
       stub_request(:get, "#{base}/Patient/missing").to_return(status: 404, body: "")
 
