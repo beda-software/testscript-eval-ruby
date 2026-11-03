@@ -12,6 +12,10 @@ module TestscriptEval
   # warning; anything else (engine, script or infrastructure errors) always fails the script
   class AssertionFailed < Error; end
 
+  # The server did not accept a fixture (autocreate), or does not have one the script reads from
+  # it: the server's answer, so a failed check, not an engine error
+  class FixtureRejected < AssertionFailed; end
+
   class NotImplementedOperation < Error; end
 
   class NotImplementedAssert < Error; end
@@ -37,12 +41,22 @@ module TestscriptEval
       }
     end
 
-    # Loads a TestScript or a fixture from a .json or .yaml file
+    # Loads a TestScript or a fixture from a .json, .xml or .yaml file
     def load_file(path, include_dir: File.dirname(path))
       content = File.read(path)
-      return JSON.parse(content) if File.extname(path) == ".json"
+      case File.extname(path).downcase
+      when ".json" then JSON.parse(content)
+      when ".xml" then parse_xml(content)
+      else YamlLoader.load(content, include_dir: include_dir)
+      end
+    end
 
-      YamlLoader.load(content, include_dir: include_dir)
+    # A FHIR R4 resource in XML as the Hash its JSON form parses to
+    def parse_xml(xml)
+      resource = FHIR::Xml.from_xml(xml)
+      raise Error, "Not a FHIR resource in XML: #{xml[0, 100]}" unless resource
+
+      JSON.parse(resource.to_json)
     end
   end
 end
@@ -53,4 +67,5 @@ require_relative "testscript_eval/client"
 require_relative "testscript_eval/server_validator"
 require_relative "testscript_eval/operations"
 require_relative "testscript_eval/assertions"
+require_relative "testscript_eval/variables"
 require_relative "testscript_eval/evaluator"

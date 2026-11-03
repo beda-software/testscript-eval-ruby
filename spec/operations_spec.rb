@@ -35,7 +35,6 @@ RSpec.describe TestscriptEval::Operations do
   end
 
   it "raises an engine error, not a failed check, for unimplemented operations" do
-    expect { run("greaterThan", 1, 2) }.to raise_error(TestscriptEval::NotImplementedOperation)
     expect { run("bogus", 1, 2) }.to raise_error(TestscriptEval::NotImplementedOperation)
   end
 end

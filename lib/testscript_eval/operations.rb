@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 module TestscriptEval
+  # The assert operators (http://hl7.org/fhir/assert-operator-codes). `source` is what the assert
+  # read (a status, header, path or expression result), `value` the assert's value. Values are
+  # compared as strings, as TestScript values are strings ("200", "true")
   module Operations
     module_function
 
@@ -12,22 +15,82 @@ module TestscriptEval
       raise NotImplementedOperation, "Operation #{operator} is not implemented"
     end
 
+    # A single-value collection (JSONPath and FHIRPath return collections) is that value
+    def scalar(source)
+      source.is_a?(Array) && source.length == 1 ? source.first : source
+    end
+
+    def same?(source, value)
+      source = scalar(source)
+      source == value || (!source.nil? && !value.nil? && source.to_s == value.to_s)
+    end
+
+    def list(values)
+      values.to_s.split(",").map(&:strip)
+    end
+
+    def values_of(source)
+      source.is_a?(Array) ? source : [source]
+    end
+
+    def blank?(source)
+      source.nil? || ((source.is_a?(Array) || source.is_a?(Hash) || source.is_a?(String)) && source.empty?)
+    end
+
+    def contains?(source, values)
+      list(values).any? do |value|
+        source = scalar(source)
+        source.is_a?(Array) ? source.any? { |item| same?(item, value) } : source.to_s.include?(value)
+      end
+    end
+
     def contains(_operator, source, values)
-      match = values.to_s.split(",").any? { |value| source.respond_to?(:include?) && source.include?(value) }
-      check(match, "#{source.inspect} not in #{values}")
+      check(!source.nil? && contains?(source, values), "#{source.inspect} does not contain #{values}")
+    end
+
+    def not_contains(_operator, source, values)
+      check(source.nil? || !contains?(source, values), "#{source.inspect} contains #{values}")
+    end
+
+    def in?(source, values)
+      !blank?(source) && values_of(source).all? { |item| list(values).any? { |value| same?(item, value) } }
+    end
+
+    def in(_operator, source, values)
+      check(in?(source, values), "#{source.inspect} not in #{values}")
+    end
+
+    def not_in(_operator, source, values)
+      check(!in?(source, values), "#{source.inspect} in #{values}")
     end
 
     def exists(_operator, source, _value)
-      check(!(source.nil? || ((source.is_a?(Array) || source.is_a?(Hash)) && source.empty?)),
-            "Exist validation issue")
+      check(!blank?(source) || source == "", "Exist validation issue")
+    end
+
+    def empty(_operator, source, _value)
+      check(blank?(source), "Got #{source.inspect}, expected no value")
     end
 
     def equals(_operator, source, value)
-      check(source == value, "Got #{source.inspect}, expected #{value.inspect}")
+      check(same?(source, value), "Got #{scalar(source).inspect}, expected #{value.inspect}")
+    end
+
+    def not_equals(_operator, source, value)
+      check(!same?(source, value), "Got #{scalar(source).inspect}, expected another value than #{value.inspect}")
+    end
+
+    def compare(operator, source, value)
+      source = scalar(source)
+      left = Float(source.to_s, exception: false)
+      right = Float(value.to_s, exception: false)
+      left, right = source.to_s, value.to_s if left.nil? || right.nil?
+      check(left.public_send(operator == "greaterThan" ? :> : :<, right),
+            "#{source.inspect} is not #{operator} #{value.inspect}")
     end
 
     def not_empty(_operator, source, _value)
-      check(!source.nil?, "Got no value, expected a non-empty one")
+      check(!blank?(source), "Got no value, expected a non-empty one")
     end
 
     # `source` is the FHIRPath result collection of a boolean expression
@@ -39,16 +102,15 @@ module TestscriptEval
       "eval" => :eval_expression,
       "exists" => :exists,
       "contains" => :contains,
-      "in" => :contains,
+      "notContains" => :not_contains,
+      "in" => :in,
+      "notIn" => :not_in,
       "equals" => :equals,
-      "notEmpty" => :not_empty,
-      # not implemented operations
-      "notEquals" => :not_implemented,
-      "notIn" => :not_implemented,
-      "greaterThan" => :not_implemented,
-      "lessThan" => :not_implemented,
-      "empty" => :not_implemented,
-      "notContains" => :not_implemented
+      "notEquals" => :not_equals,
+      "greaterThan" => :compare,
+      "lessThan" => :compare,
+      "empty" => :empty,
+      "notEmpty" => :not_empty
     }.freeze
 
     def run(operator, source, value)

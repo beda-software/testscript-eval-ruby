@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "tmpdir"
+
 RSpec.describe TestscriptEval::Evaluator do
   let(:base) { "http://fhir.test/fhir" }
   let(:env) { { "baseUrl" => base, "authorization" => "Basic dGVzdDp0ZXN0" } }
@@ -15,7 +17,7 @@ RSpec.describe TestscriptEval::Evaluator do
   end
 
   def run(definition, **options)
-    TestscriptEval.eval(definition, env, root_dir: FIXTURES_DIR, **options)
+    TestscriptEval.eval(definition, env, **{ root_dir: FIXTURES_DIR, **options })
   end
 
   def script(**parts)
@@ -124,9 +126,40 @@ RSpec.describe TestscriptEval::Evaluator do
         ] }]
       )
 
-      # jsonpath returns the matches as a list, so `equals` against a string is a warning
-      expect(run(definition)).to contain_exactly(/path: Got \["Bundle"\]/)
+      # a path matching one value is compared as that value
+      expect(run(definition)).to eq([])
       expect(a_request(:delete, "#{base}/Patient/test-patient")).to have_been_made
+    end
+
+    it "loads fixtures from paths relative to the root directory" do
+      stub_request(:get, "#{base}/Patient/test-patient").to_return(status: 200, body: patient.to_json, headers: json)
+
+      definition = script(
+        fixture: [{ "id" => "p", "resource" => { "reference" => "/resources/patient.yaml" } }],
+        test: [{ "name" => "read", "action" => [
+          { "operation" => { "type" => { "code" => "read" }, "resource" => "Patient", "targetId" => "p" } },
+          { "assert" => { "description" => "ok", "response" => "okay" } }
+        ] }]
+      )
+
+      expect(run(definition)).to eq([])
+    end
+
+    it "parses JSON fixture files as JSON, e.g. with tab indentation" do
+      stub_request(:get, "#{base}/Patient/tabbed").to_return(status: 200, body: patient.to_json, headers: json)
+
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "patient.json"), "{\n\t\"resourceType\": \"Patient\",\n\t\"id\": \"tabbed\"\n}\n")
+        definition = script(
+          fixture: [{ "id" => "p", "resource" => { "reference" => "/patient.json" } }],
+          test: [{ "name" => "read", "action" => [
+            { "operation" => { "type" => { "code" => "read" }, "resource" => "Patient", "targetId" => "p" } },
+            { "assert" => { "description" => "ok", "response" => "okay" } }
+          ] }]
+        )
+
+        expect(run(definition, root_dir: dir)).to eq([])
+      end
     end
 
     it "autodeletes created fixtures when a later autocreate fails" do
@@ -190,7 +223,9 @@ RSpec.describe TestscriptEval::Evaluator do
                                                                                          "id" => "test-patient" }.to_json,
                                                                     headers: json)
       definition["variable"] = [{ "name" => "missing", "sourceId" => "p", "expression" => "Patient.gender" }]
-      expect { evaluator.start }.to raise_error(TestscriptEval::Error, /missing expression returned no value/)
+      definition["setup"] = { "action" => [{ "operation" => { "type" => { "code" => "read" }, "resource" => "Patient",
+                                                              "params" => "/${missing}" } }] }
+      expect { evaluator.start }.to raise_error(TestscriptEval::AssertionFailed, /Variable missing: no value in p/)
       evaluator.finish
       expect(a_request(:delete, "#{base}/Patient/test-patient")).to have_been_made
     end
@@ -241,12 +276,14 @@ RSpec.describe TestscriptEval::Evaluator do
       expect(run(definition)).to contain_exactly(/Got "Peter", expected "Chalmers"/)
     end
 
-    it "skips request asserts and fails on unimplemented ones" do
+    it "checks the request with direction: request" do
       definition = script(setup: { "action" => read_patient(
-        { "direction" => "request", "compareToSourcePath" => "x" },
-        { "compareToSourcePath" => "x", "warningOnly" => true }
+        { "direction" => "request", "requestURL" => "Patient/example", "operator" => "contains" },
+        { "direction" => "request", "requestMethod" => "GET" },
+        { "direction" => "request", "headerField" => "Accept", "operator" => "contains", "value" => "json" },
+        { "direction" => "request", "requestMethod" => "post", "warningOnly" => true }
       ) })
-      expect { run(definition) }.to raise_error(TestscriptEval::NotImplementedAssert)
+      expect(run(definition)).to contain_exactly(/Got "get", expected "post"/)
     end
 
     it "requires an operation before an assert" do
@@ -254,9 +291,12 @@ RSpec.describe TestscriptEval::Evaluator do
       expect { run(definition) }.to raise_error(TestscriptEval::Error, /no preceding operation/)
     end
 
-    it "requires variables without a default value" do
-      definition = script(variable: [{ "name" => "missing" }])
-      expect { run(definition) }.to raise_error(TestscriptEval::Error, /Missing missing variable/)
+    it "requires variables without a default value where they are used" do
+      definition = script(variable: [{ "name" => "missing", "hint" => "[id]" }])
+      expect(run(definition)).to eq([])
+
+      definition["setup"] = { "action" => [{ "operation" => { "resource" => "Patient", "params" => "/${missing}" } }] }
+      expect { run(definition) }.to raise_error(TestscriptEval::Error, /Missing missing variable \(\[id\]\)/)
     end
 
     it "treats a 404 body as no resource" do

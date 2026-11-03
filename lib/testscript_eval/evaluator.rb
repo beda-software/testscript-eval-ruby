@@ -1,22 +1,38 @@
 # frozen_string_literal: true
 
+require "base64"
 require "uri"
 
 module TestscriptEval
   # Runs one TestScript: loads fixtures, autocreates them, resolves variables, then runs
   # setup, tests and teardown, and finally autodeletes fixtures
   class Evaluator
-    # TestScript operation type codes that map onto another HTTP method, with the path suffix
-    # the operation adds
+    # TestScript operation type codes (http://terminology.hl7.org/CodeSystem/testscript-operation-codes)
+    # with their HTTP method and the path suffix the operation adds. An operation's own `method`
+    # wins; other codes are taken as the HTTP method itself
     OPERATION_TYPES = {
-      "update" => ["put", ""],
       "read" => ["get", ""],
-      "search" => ["get", ""],
+      "vread" => ["get", ""],
+      "update" => ["put", ""],
+      "updateCreate" => ["put", ""],
+      "patch" => ["patch", ""],
+      "delete" => ["delete", ""],
+      "deleteCondSingle" => ["delete", ""],
+      "deleteCondMultiple" => ["delete", ""],
       "history" => ["get", "/_history"],
       "create" => ["post", ""],
+      "search" => ["get", ""],
+      "batch" => ["post", ""],
+      "transaction" => ["post", ""],
+      "capabilities" => ["get", "metadata"],
+      "validate" => ["post", "/$validate"],
+      # a named operation, given in `params` (e.g. `$validate-e-rezept`)
+      "operation" => ["post", ""],
       "populate" => ["post", "/$populate"],
       "extract" => ["post", "/$extract"]
     }.freeze
+
+    FILE_REFERENCE = /\.(json|xml|ya?ml)\z/i
 
     attr_reader :warnings
     # Swappable between phases, e.g. to record each test's requests on its own
@@ -35,6 +51,9 @@ module TestscriptEval
       @validator = validator
       @warnings = []
       @created = []
+      # responseId => Response of that operation; its resource also goes in @fixtures
+      @responses = {}
+      @last = nil
     end
 
     def tests
@@ -57,8 +76,8 @@ module TestscriptEval
       logger.info("Loading fixtures")
       @fixtures = setup_fixtures
       autocreate_fixtures
-      logger.info("Loading variables")
-      @variables = setup_variables
+      # Variables are evaluated where they are used, as they may read responses of setup operations
+      @variables = Variables.new(@definition.fetch("variable", []), @env, self)
 
       logger.info("Setup")
       eval_actions(@definition.dig("setup", "action") || [])
@@ -87,6 +106,23 @@ module TestscriptEval
       end
     end
 
+    # The resource of a response (by its responseId) or a fixture, for variables and asserts
+    def source(id)
+      raise Error, "No fixture or response '#{id}'" unless @fixtures.key?(id)
+
+      @fixtures[id]
+    end
+
+    # The resource of the last operation's response
+    attr_reader :last_resource
+
+    # The Response of an operation by its responseId, or the last one without an id
+    def response_of(id = nil)
+      return @last if id.nil?
+
+      @responses.fetch(id) { raise Error, "No response '#{id}'" }
+    end
+
     private
 
     def logger
@@ -101,55 +137,139 @@ module TestscriptEval
       @validator || ServerValidator.new(client)
     end
 
+    # Fixtures without an id (which nothing can refer to) get one, so each is kept on its own
     def fixture_definitions
-      @definition.fetch("fixture", [])
-    end
-
-    def setup_fixtures
-      fixture_definitions.to_h do |fixture|
-        [fixture["id"], load_fixture(fixture.dig("resource", "reference"))]
+      @fixture_definitions ||= @definition.fetch("fixture", []).each_with_index.map do |fixture, index|
+        fixture.key?("id") ? fixture : fixture.merge("id" => "fixture-#{index + 1}")
       end
     end
 
-    def load_fixture(reference)
+    # A fixture without a resource (only an id, e.g. a placeholder a responseId fills) is nil
+    def setup_fixtures
+      fixture_definitions.to_h do |fixture|
+        reference = fixture.dig("resource", "reference")
+        [fixture["id"], reference && load_fixture(fixture["id"], reference)]
+      end
+    end
+
+    def load_fixture(fixture_id, reference)
       if reference.start_with?("#")
         resource_type, id = reference[1..].split("/")
         contained = @definition.fetch("contained", []).find do |resource|
           resource["resourceType"] == resource_type && resource["id"] == id
         end
         contained || raise(Error, "Contained resource '#{reference}' is not found")
-      elsif reference.start_with?("file://")
-        path = File.join(@root_dir, reference.delete_prefix("file://"))
-        YamlLoader.load(File.read(path), include_dir: @include_dir)
-      # relative references to FHIR server baseUrl
-      elsif reference.match?(/\A[A-Z]/)
-        _response, resource = client.execute(reference, method: "get")
-        resource
+      # files: `file://examples/x.json`, or a path (`/examples/x.json`, `../Fixtures/x.xml`,
+      # `x.json`), all from the root directory
+      elsif reference.start_with?("file://") || reference.match?(FILE_REFERENCE)
+        path = File.expand_path(reference.delete_prefix("file://").delete_prefix("/"), @root_dir)
+        raise Error, "Fixture '#{fixture_id}': file #{reference} is not found (#{path})" unless File.exist?(path)
+
+        # JSON files are parsed as JSON: valid JSON is not always valid YAML, e.g. with tab indentation
+        TestscriptEval.load_file(path, include_dir: @include_dir)
+      # resources on the server: relative references to baseUrl (`Patient/example`) or absolute URLs
+      elsif reference.match?(%r{\A([A-Z]|https?://)})
+        read_server_fixture(fixture_id, reference)
       else
         raise Error, "Reference '#{reference}' is not supported"
       end
     end
 
+    def read_server_fixture(fixture_id, reference)
+      response, resource = client.execute(reference, method: "get")
+      return resource if (200..299).cover?(response.status) && resource.is_a?(Hash)
+
+      raise FixtureRejected, "Fixture '#{fixture_id}': #{reference} could not be read from the server " \
+                   "(status #{response.status}); the script expects it to exist there"
+    end
+
     # `@created` is filled one fixture at a time, so if a later create fails
     # the fixtures already on the server are still autodeleted
     def autocreate_fixtures
-      fixture_definitions.each do |definition|
-        next unless definition.fetch("autocreate", false)
+      definitions = fixture_definitions.select { |definition| definition.fetch("autocreate", false) }
+      definitions.each do |definition|
+        unless @fixtures[definition["id"]].is_a?(Hash)
+          raise Error, "Autocreate fixture '#{definition["id"]}' has no resource"
+        end
+      end
 
+      # Fixtures with ids go in one transaction, so references between them resolve whatever
+      # their order, even in cycles, on servers that check references
+      together = definitions.select { |definition| transactable?(@fixtures[definition["id"]]) }
+      together = [] unless together.length > 1 && autocreate_together(together)
+
+      (definitions - together).each do |definition|
         fixture_id = definition["id"]
         fixture = @fixtures[fixture_id]
         logger.info("Autocreate fixture #{fixture_id}")
+        next autocreate_bundle(fixture_id, fixture) if transaction?(fixture)
+
         # A fixture with an id is created under that id (update as create), so references
         # between fixtures (e.g. Patient/<id>) resolve on the server as written
         path, method = fixture.key?("id") ? ["#{fixture["resourceType"]}/#{fixture["id"]}", "put"] : [fixture["resourceType"], "post"]
         response, resource = client.execute(path, method: method, data: fixture)
         unless (200..299).cover?(response.status)
-          raise Error, "Autocreate of fixture '#{fixture_id}' failed with status #{response.status}: #{resource}"
+          raise FixtureRejected, "Autocreate of fixture '#{fixture_id}' failed with status #{response.status}: #{resource}"
         end
 
         # Later references, variables and autodelete must use the server-assigned id
         @fixtures[fixture_id] = resource || fixture.merge("id" => created_id(response, fixture, fixture_id))
         @created << fixture_id
+      end
+    end
+
+    def transactable?(fixture)
+      fixture.key?("id") && !transaction?(fixture)
+    end
+
+    # PUTs the fixtures in one transaction Bundle. False when the server does not take it (e.g.
+    # no transaction support, or a fixture it rejects), and the fixtures are created one by one
+    def autocreate_together(definitions)
+      logger.info("Autocreate fixtures #{definitions.map { |definition| definition["id"] }.join(", ")} in a transaction")
+      entries = definitions.map do |definition|
+        fixture = @fixtures[definition["id"]]
+        { "resource" => fixture, "request" => { "method" => "PUT", "url" => "#{fixture["resourceType"]}/#{fixture["id"]}" } }
+      end
+      response, resource = client.execute("", method: "post", data: { "resourceType" => "Bundle", "type" => "transaction",
+                                                                      "entry" => entries })
+      unless (200..299).cover?(response.status) && resource.is_a?(Hash)
+        logger.warn("Transaction of the fixtures failed with status #{response.status}, creating them one by one")
+        return false
+      end
+
+      definitions.each_with_index do |definition, index|
+        created = resource.dig("entry", index, "resource")
+        @fixtures[definition["id"]] = created if created.is_a?(Hash) && created["resourceType"]
+        @created << definition["id"]
+      end
+      true
+    end
+
+    def transaction?(fixture)
+      fixture["resourceType"] == "Bundle" && %w[transaction batch].include?(fixture["type"])
+    end
+
+    # A transaction or batch Bundle is posted to the server root, which creates its entries; the
+    # fixture becomes the response Bundle, and autodelete deletes the entries' resources
+    def autocreate_bundle(fixture_id, fixture)
+      response, resource = client.execute("", method: "post", data: fixture)
+      unless (200..299).cover?(response.status) && resource.is_a?(Hash)
+        raise FixtureRejected, "Autocreate of fixture '#{fixture_id}' failed with status #{response.status}: #{resource}"
+      end
+
+      @fixtures[fixture_id] = resource
+      @created << fixture_id
+    end
+
+    # The Type/id of every resource a transaction or batch response reports as created or updated
+    def bundle_locations(bundle)
+      bundle.fetch("entry", []).filter_map do |entry|
+        location = entry.dig("response", "location")
+        next unless location
+
+        parts = URI.parse(location).path.split("/").reject(&:empty?)
+        parts = parts[0...parts.index("_history")] if parts.include?("_history")
+        parts.last(2).join("/")
       end
     end
 
@@ -174,75 +294,129 @@ module TestscriptEval
         next if definition.fetch("autocreate", false) && !@created.include?(fixture_id)
 
         fixture = @fixtures[fixture_id]
-        unless fixture.is_a?(Hash) && fixture.key?("id")
+        targets = autodelete_targets(definition, fixture)
+        if targets.empty?
           logger.warn("Autodelete fixture #{fixture_id} skipped: it has no id")
           next
         end
 
         logger.info("Autodelete fixture #{fixture_id}")
-        response, _resource = client.execute("#{fixture["resourceType"]}/#{fixture["id"]}", method: "delete")
-        unless (200..299).cover?(response.status) || [404, 410].include?(response.status)
-          logger.warn("Autodelete of fixture #{fixture_id} failed with status #{response.status}")
-        end
+        targets.reverse_each { |target| delete(fixture_id, target) }
       end
     end
 
-    def setup_variables
-      @definition.fetch("variable", []).to_h do |variable|
-        name = variable["name"]
-        if variable.key?("sourceId") && variable.key?("expression")
-          result = Misc.fhirpath(@fixtures.fetch(variable["sourceId"]), variable["expression"])
-          raise Error, "Variable #{name} expression returned no value" if result.empty?
-
-          [name, result.first]
-        else
-          value = @env.fetch(name, variable["defaultValue"])
-          raise Error, "Missing #{name} variable" if value.nil? || value == ""
-
-          [name, value]
-        end
+    def autodelete_targets(definition, fixture)
+      return [] unless fixture.is_a?(Hash)
+      # an autocreated transaction: the fixture is the response Bundle
+      if definition.fetch("autocreate", false) && fixture["resourceType"] == "Bundle" &&
+         %w[transaction-response batch-response].include?(fixture["type"])
+        return bundle_locations(fixture)
       end
+
+      fixture.key?("id") ? ["#{fixture["resourceType"]}/#{fixture["id"]}"] : []
     end
 
-    def eval_actions(actions)
-      response = nil
-      resource = nil
+    def delete(fixture_id, target)
+      response, _resource = client.execute(target, method: "delete")
+      return if (200..299).cover?(response.status) || [404, 410].include?(response.status)
+
+      logger.warn("Autodelete of fixture #{fixture_id} (#{target}) failed with status #{response.status}")
+    end
+
+    def eval_actions(actions, response = nil, resource = nil)
       actions.each do |action|
-        if action.key?("operation")
+        if action.key?("common")
+          response, resource = eval_common(action["common"], response, resource)
+        elsif action.key?("operation")
           response, resource = execute_operation(action["operation"])
         else
-          raise Error, "Assert has no preceding operation response" if response.nil?
+          assertion = action["assert"]
+          raise Error, "Assert has no preceding operation response" if response.nil? && !assertion.key?("sourceId")
 
-          warning = Assertions.evaluate(action["assert"], response, resource, assertion_context)
+          warning = Assertions.evaluate(assertion, response, resource, assertion_context)
           @warnings << warning if warning
         end
       end
+      [response, resource]
+    end
+
+    # A TestScript.common action group (R5), run in place with its parameters as variables; its
+    # asserts see the response of the operation before it
+    def eval_common(common, response, resource)
+      key = common["keyRef"]
+      group = @definition.fetch("common", []).find { |item| item["key"] == key }
+      raise Error, "Common actions '#{key}' are not found" unless group
+
+      parameters = common.fetch("parameter", []).to_h { |parameter| [parameter["name"], resolve(parameter["value"])] }
+      @variables.with(parameters) { eval_actions(group.fetch("action", []), response, resource) }
     end
 
     def execute_operation(operation)
       logger.info(operation["description"])
-      target = operation["resource"].to_s
-      target +=
-        if operation.key?("targetId")
-          "/#{@fixtures.fetch(operation["targetId"])["id"]}"
-        else
-          Misc.resolve_string_template(operation.fetch("params", ""), @variables)
-        end
-
-      method = "get"
-      if operation.key?("type")
-        code = operation.dig("type", "code")
-        method, suffix = OPERATION_TYPES.fetch(code, [code, ""])
-        target += suffix
-      end
+      code = operation.dig("type", "code")
+      method, suffix = OPERATION_TYPES.fetch(code) { [code || "get", ""] }
       method = operation.fetch("method", method)
+      path, query = request_target(operation, code, suffix).to_s.split("?", 2)
+      path ||= "" # a transaction or batch goes to the server root
+      # GET, HEAD and DELETE have no body, whatever sourceId says
+      data = operation.key?("sourceId") && !%w[get head delete].include?(method.to_s.downcase) ? source(operation["sourceId"]) : nil
+      content_type = operation["contentType"]
+      # A Binary sent anywhere but to Binary is its content (e.g. a document to $validate)
+      if binary?(data) && !path.start_with?("Binary", "/Binary")
+        content_type = data["contentType"]
+        data = Base64.decode64(data["data"].to_s)
+      end
 
-      data = operation.key?("sourceId") ? @fixtures.fetch(operation["sourceId"]) : nil
-      path, query = target.split("?", 2)
-      response, resource = client.execute(path, method: method, data: data, params: query_params(query))
-
-      @fixtures[operation["responseId"]] = resource if operation.key?("responseId")
+      response, resource = client.execute(
+        path, method: method, data: data, params: query_params(query), headers: request_headers(operation),
+              accept: operation["accept"], content_type: content_type
+      )
+      @last = response
+      @last_resource = resource
+      if operation.key?("responseId")
+        @responses[operation["responseId"]] = response
+        @fixtures[operation["responseId"]] = resource
+      end
       [response, resource]
+    end
+
+    # The path and query of an operation: its `url`, or the resource type (or the targetId
+    # fixture's type and id) with `params` and the operation's suffix
+    def request_target(operation, code, suffix)
+      return resolve(operation["url"]) if operation.key?("url")
+      return suffix if code == "capabilities"
+
+      target = operation["resource"].to_s
+      if operation.key?("targetId")
+        fixture = source(operation["targetId"])
+        raise Error, "targetId '#{operation["targetId"]}' has no resource" unless fixture.is_a?(Hash)
+
+        target = fixture["resourceType"] if target.empty?
+        target += "/#{fixture["id"]}"
+        target += "/_history/#{fixture.dig("meta", "versionId")}" if code == "vread"
+      end
+
+      path, query = resolve(operation.fetch("params", "")).to_s.split("?", 2)
+      path ||= ""
+      # `params` is a path (`/example`, `$op`), a query (`?name=x`) or a bare query (`profile=x`)
+      if path.include?("=") && query.nil?
+        query = path
+        path = ""
+      end
+      path = "/#{path}" if path.start_with?("$") && !target.empty?
+      [target, path, suffix].join + (query ? "?#{query}" : "")
+    end
+
+    def binary?(data)
+      data.is_a?(Hash) && data["resourceType"] == "Binary" && data.key?("data")
+    end
+
+    def request_headers(operation)
+      operation.fetch("requestHeader", []).to_h { |header| [header["field"], resolve(header["value"])] }
+    end
+
+    def resolve(string)
+      Misc.resolve_string_template(string, @variables)
     end
 
     # Like Python's parse_qs: repeated keys are grouped, blank values dropped
@@ -256,8 +430,18 @@ module TestscriptEval
 
     def assertion_context
       Assertions::Context.new(
-        variables: @variables, fixtures: @fixtures, validator: validator, profiles: @definition.fetch("profile", [])
+        variables: @variables, fixtures: @fixtures, responses: @responses, validator: validator,
+        profiles: profiles
       )
+    end
+
+    # TestScript.profile: References with ids (R4), or canonical URLs with the ids in `_profile` (R5)
+    def profiles
+      @profiles ||= @definition.fetch("profile", []).each_with_index.map do |profile, index|
+        next profile if profile.is_a?(Hash)
+
+        { "id" => @definition.dig("_profile", index, "id"), "reference" => profile }
+      end
     end
   end
 end

@@ -23,10 +23,12 @@ warnings = TestscriptEval.eval(definition, {
 })
 ```
 
-`TestscriptEval.eval` loads fixtures, autocreates them, resolves variables, then runs `setup`,
-every `test` and `teardown` (always), and finally autodeletes fixtures.
+`TestscriptEval.eval` loads fixtures, autocreates them, then runs `setup`, every `test` and
+`teardown` (always), and finally autodeletes fixtures. Variables are evaluated where they are used,
+so they can read the responses of earlier operations.
 
-- A failed assert raises `TestscriptEval::AssertionFailed`.
+- A failed assert raises `TestscriptEval::AssertionFailed`. So does a fixture the server rejects
+  or does not have (`TestscriptEval::FixtureRejected`), as that is the server's answer.
 - A failed `warningOnly` assert does not stop the script; its message is in the returned array.
 - Anything else (an unsupported assert or operator, a missing variable, a `$validate` the server
   could not run) raises `TestscriptEval::Error` or one of its subclasses, `warningOnly` or not.
@@ -37,13 +39,15 @@ values for TestScript variables without a `sourceId`. Without one, it is read fr
 
 Options:
 
-- `root_dir:` (default: the current directory) resolves `file://` fixture references, e.g.
-  `file://tests/resources/patient.yaml`.
+- `root_dir:` (default: the current directory) resolves file fixture references (`.json`, `.xml`, `.yaml`),
+  as a `file://` URL or a path from the root: `file://tests/resources/patient.yaml`,
+  `/tests/resources/patient.yaml`, `../Fixtures/patient.xml`.
 - `include_dir:` (default: `<root_dir>/tests/resources`) resolves `!include path` tags in YAML fixtures.
 
 - `client:` a `TestscriptEval::Client` to send requests with (default: `Client.build(baseUrl, authorization:)`).
   `Client.new(fhir_client) { |reply| ... }` wraps any configured `FHIR::Client` and yields every
-  `FHIR::ClientReply`, e.g. to record requests.
+  `FHIR::ClientReply`, e.g. to record requests. With `xml: false` (for JSON-only servers such as
+  Aidbox), operations that ask for XML are sent and accepted as JSON.
 - `validator:` what `validateProfileId` asserts call: anything responding to `call(resource, profile_url)` that
   returns the validation error messages (default: `ServerValidator`, `$validate` on the server under test).
 
@@ -75,14 +79,28 @@ level; quiet it with `FHIR.logger.level = Logger::WARN`.
 
 ## Supported features
 
-- Fixtures: contained (`#Type/id`), files (`file://`), server references (`Type/id`), `autocreate`,
-  `autodelete`
-- Operations: `read`, `search`, `create`, `update`, `delete`, `history`, `populate`, `extract`, or an
-  explicit `method` (`get`, `post`, `put`, `delete`), with `params`, `targetId`, `sourceId`, `responseId`
-- Asserts: `response`, `responseCode`, `resource`, `headerField`, `contentType`, `path` (JSONPath),
-  `expression` (FHIRPath), `value`, `compareToSourceExpression`, `minimumId`, `navigationLinks`,
-  `validateProfileId` (via `$validate`)
-- Operators: `equals`, `in`, `contains`, `exists`, `notEmpty`, `eval`
+- Fixtures: contained (`#Type/id`), files (`file://`, `/path`, relative paths; JSON, XML or YAML),
+  server references (`Type/id` or a URL), fixtures without a resource (placeholders) or an id.
+  `autocreate` puts fixtures with ids in one transaction (so references between them resolve, even in
+  cycles; one by one when the server refuses it), posts transaction/batch Bundles to the server root;
+  `autodelete` deletes them, including what a transaction Bundle created.
+- Operations: every `testscript-operation-codes` type (`read`, `vread`, `search`, `create`, `update`,
+  `updateCreate`, `patch`, `delete`, `history`, `transaction`, `batch`, `capabilities`, `validate`,
+  `operation` with `params: $name`, …) or an explicit `method`, with `url`, `params` (path, query or
+  `$operation`), `resource`, `targetId`, `sourceId` (a Binary goes as its content), `responseId`,
+  `requestHeader`, `accept` and `contentType` (`json`, `xml` or a MIME type)
+- Variables: `defaultValue`, env values, `expression` (FHIRPath, or XPath in an `application/xml`
+  Expression), `path` (JSONPath or XPath), `headerField`, against a `sourceId` fixture or response or
+  the last response
+- Asserts: `response` (all response codes), `responseCode`, `resource`, `headerField`, `contentType`,
+  `path`, `expression`, `value`, `compareToSourceExpression`, `compareToSourcePath`, `minimumId`,
+  `navigationLinks`, `requestURL`, `requestMethod`, `validateProfileId`, `sourceId`, and
+  `direction: request`; `${variables}` in values, paths and expressions
+- Operators: `equals`, `notEquals`, `in`, `notIn`, `contains`, `notContains`, `greaterThan`, `lessThan`,
+  `empty`, `notEmpty`, `exists`, `eval`
+- R5: `common` actions with parameters, `profile` as canonical URLs with ids in `_profile`
+- Not supported: `origin`/`destination` (every operation goes to the one server), `stopTestOnFail`
+  (a failed assert always ends its test)
 
 ## Development
 
